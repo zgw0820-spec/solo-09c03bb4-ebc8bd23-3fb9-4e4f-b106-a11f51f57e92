@@ -14,6 +14,11 @@
 - 在途切换识别：源站用 X-Rule-Epoch 标识规则世代，代理回源前探测基准
   世代；回源期间规则被别的请求切换时，在途答复只返回给其原始请求
   （INFLIGHT_RULE_SWITCHED / STALE_INFLIGHT_304），不写入新缓存。
+  新规则已被别的请求确认后才到达的旧规则回包同样只给原请求，既不恢复
+  旧规则，也不刷新当前条目。
+- 面向 CDN 的回包：正常答复携带与正文对应的 Vary、原始 max-age 与 Age，
+  CDN 只会按 Vary 匹配请求，并在代理剩余新鲜期内复用；只给原请求的答复
+  一律 Cache-Control: no-store。
 - 回源失败返回 502，不改动任何已确认的缓存状态。
 """
 from __future__ import annotations
@@ -27,7 +32,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 
 ORIGIN_BASE = os.environ.get("ORIGIN_BASE", "http://origin:8080")
-REPLAY_HEADERS = ("content-type", "content-language", "etag", "cache-control")
+REPLAY_HEADERS = ("content-type", "content-language", "etag")
 
 app = FastAPI(title="cache-proxy", version="1.0")
 
@@ -105,8 +110,39 @@ def _variant_key(vary: tuple[str, ...], headers) -> tuple[str, ...]:
     return tuple(headers.get(h.lower(), "") for h in vary)
 
 
-def _build_response(entry: Entry, cache_status: str) -> Response:
+_HEADER_CASE = {
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "accept-encoding": "Accept-Encoding",
+    "cookie": "Cookie",
+    "user-agent": "User-Agent",
+}
+
+
+def _vary_value(vary: tuple[str, ...]) -> str:
+    """把解析后的 Vary 字段名还原成规范的响应头值。"""
+    return ", ".join(_HEADER_CASE.get(name, name) for name in vary)
+
+
+def _age_seconds(entry: Entry) -> int:
+    return max(0, int(time.time() - entry.stored_at))
+
+
+def _build_response(entry: Entry, cache_status: str, *, private: bool = False) -> Response:
+    # 缓存指令由代理统一决定，不回放源站旧值，避免重复 Cache-Control
     headers = {k: v for k, v in entry.headers.items() if k in REPLAY_HEADERS}
+    # Vary 取正文被选中时对应的规则（而不是可能已变化的当前规则），
+    # CDN 才会按语言 / 格式分别匹配请求，不会把中文回包发给英文请求
+    if entry.vary:
+        headers["Vary"] = _vary_value(entry.vary)
+    if private:
+        # 只给原请求的答复：CDN 不得存储、不得用于其他请求
+        headers["Cache-Control"] = "no-store"
+    else:
+        # 已确认的 max-age + 已消耗的 Age：CDN 只会在代理剩余的新鲜期内复用它，
+        # 而不是把这次命中当成一份全新的 max-age 重新计时
+        headers["Cache-Control"] = f"max-age={entry.max_age}"
+        headers["Age"] = str(_age_seconds(entry))
     headers["X-Cache"] = cache_status
     headers["X-Cache-Generation"] = str(entry.fetch_generation)
     return Response(content=entry.body, status_code=200, headers=headers)
@@ -158,6 +194,7 @@ async def cache_inspect() -> dict:
                     "etag": e.etag,
                     "vary": list(e.vary),
                     "age_seconds": round(time.time() - e.stored_at, 2),
+                    "stored_at": e.stored_at,
                     "max_age": e.max_age,
                     "fresh": time.time() - e.stored_at < e.max_age,
                     "generation": e.fetch_generation,
@@ -194,10 +231,10 @@ def _select_entry(st: PathState, request: Request, identity_key: tuple[str, ...]
     def _usable(candidate: "Entry | None") -> "Entry | None":
         if candidate is None or candidate.fetch_generation != st.generation:
             return None
-        # 冷启动期暂存在空键下的条目只能被同协商身份复用；
-        # 正式条目按 Vary 规则入键，同键即同表示，允许跨身份共享
+        # 规则尚未确认的冷启动期，暂存在空键下的条目只能被同协商身份复用；
+        # 一旦确认规则（即使规则为空），同键即同表示，允许跨身份共享
         # （例如 Vary 切到只按 Accept 后，不同语言共享一份正文）
-        if candidate.variant_key == () and candidate.identity != identity_key:
+        if st.vary is None and candidate.variant_key == () and candidate.identity != identity_key:
             return None
         return candidate
 
@@ -209,28 +246,59 @@ def _select_entry(st: PathState, request: Request, identity_key: tuple[str, ...]
 
 def _commit_upstream(st: PathState, request: Request, identity_key: tuple[str, ...],
                      upstream: httpx.Response, entry: "Entry | None",
-                     epoch_before: int | None, snapshot_generation: int):
+                     epoch_before: int | None, snapshot_generation: int,
+                     snapshot_epoch: int | None):
     """回源成功后，在路径锁内原子完成规则确认/切换/写入，返回 (Response, 是否错误)。"""
     # 注意：upstream 缺少 Vary 头时按空规则处理，不能回退到旧规则
     if "vary" in upstream.headers:
         origin_vary = _parse_vary(upstream.headers.get("vary"))
     else:
         origin_vary = ()
-    origin_epoch = int(upstream.headers.get("x-rule-epoch", "0"))
+    epoch_header = upstream.headers.get("x-rule-epoch")
+    epoch_known = epoch_header is not None
+    origin_epoch = int(epoch_header) if epoch_known else 0
     current_vary = st.vary
-    vary_changed = current_vary is not None and set(origin_vary) != set(current_vary)
     first_confirmation = st.confirmed_epoch is None
+    vary_changed = current_vary is not None and set(origin_vary) != set(current_vary)
+
+    # 本次回源期间是否有别的请求确认过新规则。只有此时低世代回包才是
+    # “迟到的旧规则回包”；若期间无人确认，低世代只能说明源站世代回退
+    # （例如重启 / 管理端复位），应按新答复重新确认，不能永久卡在旧规则。
+    committed_during_fetch = (
+        st.generation != snapshot_generation or st.confirmed_epoch != snapshot_epoch
+    )
+    # 发起复验时选中的条目若已被并发的规则切换清出当前世代，就不能再
+    # 把这次 304 的元数据写回它（否则等于刷新/复活一个已失效条目）。
+    revalidated_entry_stale = entry is not None and entry.fetch_generation != st.generation
+
+    # 旧规则回包：本次回源期间别的请求已确认过新规则，而这份回包仍带着
+    # 旧规则（世代更低，或同世代却给出不同的 Vary）。它只能答复原请求，
+    # 不能恢复旧规则、也不能刷新当前条目。若期间无人确认，低世代只说明
+    # 源站世代回退（如重启 / 管理端复位），应按新答复重新确认，避免卡死。
+    stale_rule_reply = (
+        (epoch_known and not first_confirmation and committed_during_fetch and (
+            origin_epoch < st.confirmed_epoch
+            or (origin_epoch == st.confirmed_epoch and vary_changed)
+        ))
+        or (revalidated_entry_stale and upstream.status_code == 304)
+    )
+
     # 在途切换：回源发起前的源站世代与响应世代不同，且新世代已被别的请求提交，
     # 或代理 generation 在回源期间已被递增。顺序切换的发现者不在此列。
     epoch_mismatch = epoch_before is not None and epoch_before != origin_epoch
-    inflight_switch = epoch_mismatch and (
-        st.generation != snapshot_generation or (st.confirmed_epoch == origin_epoch)
+    inflight_switch = stale_rule_reply or (
+        epoch_mismatch
+        and (st.generation != snapshot_generation or st.confirmed_epoch == origin_epoch)
     )
 
     if inflight_switch:
-        # 规则已在本请求回源期间被别的请求切换：结果只给原请求，不入缓存
-        if upstream.status_code == 304 and entry is not None:
-            return _build_response(entry, "STALE_INFLIGHT_304"), False
+        # 结果只给原请求：不改动已确认规则与任何缓存条目
+        if upstream.status_code == 304:
+            if entry is None:
+                st.stats["origin_errors"] += 1
+                return Response(b"origin 304 without cached representation\n", status_code=502,
+                                headers={"X-Cache": "ORIGIN_ERROR", "Cache-Control": "no-store"}), True
+            return _build_response(entry, "STALE_INFLIGHT_304", private=True), False
         passthrough = Entry(
             body=upstream.content,
             headers={k.lower(): v for k, v in upstream.headers.items()},
@@ -242,7 +310,7 @@ def _commit_upstream(st: PathState, request: Request, identity_key: tuple[str, .
             max_age=_parse_max_age(upstream.headers.get("cache-control")),
             fetch_generation=snapshot_generation,
         )
-        return _build_response(passthrough, "INFLIGHT_RULE_SWITCHED"), False
+        return _build_response(passthrough, "INFLIGHT_RULE_SWITCHED", private=True), False
 
     if vary_changed:
         # 旧规则条目整体失效，确认新规则
@@ -263,8 +331,11 @@ def _commit_upstream(st: PathState, request: Request, identity_key: tuple[str, .
             st.stats["vary_switches"] += 1
         rekeyed = {}
         for old_entry in st.entries.values():
-            real_key = _variant_key(origin_vary, old_entry.headers)
+            # 用产生该条目的请求协商身份重算键（响应头里没有 Accept 等请求头）
+            req_headers = {"accept": old_entry.identity[0], "accept-language": old_entry.identity[1]}
+            real_key = _variant_key(origin_vary, req_headers)
             old_entry.variant_key = real_key
+            old_entry.vary = origin_vary
             rekeyed[real_key] = old_entry
         st.entries = rekeyed
     else:
@@ -275,8 +346,10 @@ def _commit_upstream(st: PathState, request: Request, identity_key: tuple[str, .
     if upstream.status_code == 304:
         if entry is None:
             st.stats["origin_errors"] += 1
-            return Response(b"origin 304 without cached representation\n", status_code=502), True
-        # 沿用发起复验时选中的正文，仅刷新元数据
+            return Response(b"origin 304 without cached representation\n", status_code=502,
+                            headers={"X-Cache": "ORIGIN_ERROR", "Cache-Control": "no-store"}), True
+        # 沿用发起复验时选中的正文，仅刷新元数据；规则切换由本次 304 发现时，
+        # 正文按这次确认的规则重新入键，并按这次答复的 max-age 重新计时
         entry.stored_at = time.time()
         entry.max_age = _parse_max_age(upstream.headers.get("cache-control"), entry.max_age)
         if etag_new := upstream.headers.get("etag"):
@@ -285,7 +358,6 @@ def _commit_upstream(st: PathState, request: Request, identity_key: tuple[str, .
         entry.vary = origin_vary
         entry.fetch_generation = st.generation
         if vary_changed:
-            # 规则切换由本次 304 发现并提交：旧正文按新规则重新入键
             entry.variant_key = new_key
             st.entries[new_key] = entry
             st.stats["fetches"] += 1
@@ -343,6 +415,7 @@ async def proxy_get(full_path: str, request: Request) -> Response:
         sync.in_flight = True
 
     snapshot_generation = st.generation
+    snapshot_epoch = st.confirmed_epoch
     try:
         entry = _select_entry(st, request, identity_key)
         if entry is not None and time.time() - entry.stored_at < entry.max_age:
@@ -365,7 +438,7 @@ async def proxy_get(full_path: str, request: Request) -> Response:
             return Response(
                 f"origin {kind} failed: {exc}\n".encode(),
                 status_code=502,
-                headers={"X-Cache": "ORIGIN_ERROR"},
+                headers={"X-Cache": "ORIGIN_ERROR", "Cache-Control": "no-store"},
             )
 
         if upstream.status_code not in (200, 304):
@@ -376,12 +449,13 @@ async def proxy_get(full_path: str, request: Request) -> Response:
             return Response(
                 f"origin returned status {upstream.status_code}\n".encode(),
                 status_code=502,
-                headers={"X-Cache": "ORIGIN_ERROR"},
+                headers={"X-Cache": "ORIGIN_ERROR", "Cache-Control": "no-store"},
             )
 
         async with st.path_lock:
             response, _ = _commit_upstream(
-                st, request, identity_key, upstream, entry, epoch_before, snapshot_generation
+                st, request, identity_key, upstream, entry, epoch_before,
+                snapshot_generation, snapshot_epoch,
             )
         return response
     finally:

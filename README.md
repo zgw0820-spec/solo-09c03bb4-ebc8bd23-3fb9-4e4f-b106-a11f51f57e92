@@ -10,10 +10,10 @@
 ```
 
 - `app/origin.py`：本地源站。按 `Accept` 选 JSON / Markdown，可切换是否再按
-  `Accept-Language` 选语言；管理 API 可注入回包延迟、故障、切换 Vary 规则。
+  `Accept-Language` 选语言；管理 API 可注入回包延迟、故障、挂起、切换 Vary 规则。
 - `app/proxy.py`：缓存代理，实现全部缓存与并发语义。
 - `app/content.py`：中英文发布说明示例内容。
-- `app/tests/selftest.py`：端到端自测（51 项断言，含并发切换）。
+- `app/tests/selftest.py`：端到端自测（80 项断言，含 CDN 回包头、304 确认新规则、并发切换与迟到旧回包）。
 
 ## 缓存语义（与需求逐条对应）
 
@@ -29,8 +29,15 @@
 5. **切换时在途请求隔离**：源站通过 `X-Rule-Epoch` 标识规则世代；代理回源前探测
    基准世代，响应世代不一致且规则已被其他请求提交时，该在途答复只返回给它的
    原始请求（`X-Cache: INFLIGHT_RULE_SWITCHED` / `STALE_INFLIGHT_304`），不写入新缓存。
-6. **回源失败保状态**：连接错误或源站 5xx 返回 502（`X-Cache: ORIGIN_ERROR`），
-   不修改任何已确认的缓存条目与规则；已缓存的新鲜内容仍可正常命中。
+   新规则已被别的请求确认之后才到达的旧规则回包同样只给原请求：不恢复旧规则、
+   不刷新当前条目（`X-Cache: INFLIGHT_RULE_SWITCHED` / `STALE_INFLIGHT_304`）。
+6. **面向 CDN 的回包**：正常回包携带与正文对应的 `Vary`（缓存按该规则匹配请求，
+   中文回包不会发给英文请求），并回放原始 `max-age` 与 `Age`（代理已消耗的新鲜期），
+   CDN 只在代理剩余新鲜期内复用，不会把命中当成新内容从头计时。
+   只给原请求的回包一律 `Cache-Control: no-store`，禁止 CDN 存储。
+7. **回源失败保状态**：连接错误或源站 5xx 返回 502（`X-Cache: ORIGIN_ERROR`），
+   不修改任何已确认的缓存条目与规则；已缓存的新鲜内容仍可正常命中，
+   过期条目按此前确认的期限处理。
 
 ## 用 Docker Compose 启动
 
@@ -38,18 +45,17 @@
 docker compose up -d --build
 # 代理: http://localhost:18000   源站: http://localhost:18080
 
-# API 演示（协商、命中、304 复验、规则切换失效、故障保缓存）
+# API 演示（CDN 头、两种语言、临期命中、并行复验、规则切换、故障保缓存）
 bash demo/api-demo.sh
 
-# 并发切换自测（51 项断言）
+# 全部自测（80 项断言）
 docker compose run --rm self-test
 ```
 
 ## 无 Docker 时本地裸跑
 
 ```bash
-python3 -m pip install --user virtualenv
-python3 -m virtualenv .venv
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 bash scripts/start-local.sh
 PROXY_BASE=http://127.0.0.1:18000 ORIGIN_BASE=http://127.0.0.1:18080 \
@@ -68,6 +74,7 @@ bash scripts/stop-local.sh
 | 代理 | `POST /_cache/age` | 测试辅助：把条目录龄（模拟 max-age 到期） |
 | 源站 | `POST /admin/vary/{accept,both}` | 切换 Vary 规则 |
 | 源站 | `POST /admin/delay/{ms}` | 设置回包延迟 |
+| 源站 | `POST /admin/hold/{ms}/{n}` | 接下来 n 个回包渲染后额外挂起 ms（复现旧规则回包晚到） |
 | 源站 | `POST /admin/fail/{n}` | 接下来 n 个请求返回 500 |
 | 源站 | `GET /admin/wait_inflight/{n}` | 测试同步：等待 n 个请求在途 |
 | 源站 | `GET /admin/state` | 源站状态与请求计数 |
@@ -79,3 +86,5 @@ bash scripts/stop-local.sh
 - 为识别“回源在途期间的规则切换”，代理每次回源前会额外请求一次源站
   `/rule_epoch` 探测基准世代；该端点很轻量，但若源站不支持等价机制，
   在途切换的精确识别只能退化为按 Vary 头比对。
+- 源站不提供 `X-Rule-Epoch` 时，代理无法区分“迟到的旧规则回包”与“源站
+  世代回退”，只能按当前 Vary 规则处理；建议生产源站始终返回该头部。

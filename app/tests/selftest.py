@@ -73,8 +73,40 @@ async def test_content_negotiation_and_hit(c: httpx.AsyncClient) -> None:
     check("已确认 Vary 为两个头", inspect["paths"]["/releases"]["confirmed_vary"] == ["accept", "accept-language"])
 
 
+async def test_cdn_response_headers(c: httpx.AsyncClient) -> None:
+    print("[2] 回包面向 CDN：Vary 与正文对应，Age 延续代理剩余新鲜期")
+    await reset(c)
+    zh = {"Accept": JSON, "Accept-Language": ZH}
+    en = {"Accept": JSON, "Accept-Language": EN}
+    r_zh = await c.get(f"{PROXY}/releases", headers=zh)
+    r_en = await c.get(f"{PROXY}/releases", headers=en)
+
+    def vary_set(resp: httpx.Response) -> set[str]:
+        return {p.strip().lower() for p in resp.headers.get("vary", "").split(",") if p.strip()}
+
+    check("中文 200 带 Vary（含语言）", vary_set(r_zh) == {"accept", "accept-language"},
+          r_zh.headers.get("vary", ""))
+    check("英文 200 同样带 Vary", vary_set(r_en) == {"accept", "accept-language"},
+          r_en.headers.get("vary", ""))
+    check("中文正文只对应中文 Vary（内容确为中文）", "发布说明" in r_zh.text)
+    check("首个 200 的 Age 为 0", r_zh.headers.get("age") == "0", r_zh.headers.get("age"))
+    check("只有一条 Cache-Control", len(r_zh.headers.get_list("cache-control")) == 1,
+          str(r_zh.headers.get_list("cache-control")))
+    check("保留源站 max-age=30", "max-age=30" in r_zh.headers.get("cache-control", ""),
+          r_zh.headers.get("cache-control"))
+
+    # 临期命中：代理已消耗 22s，回包 Age=22，CDN 只能再复用 8s 而不是重新计时 30s
+    await c.post(f"{PROXY}/_cache/age", json={"seconds": 22})
+    near = await c.get(f"{PROXY}/releases", headers=zh)
+    check("临期命中仍为 HIT", near.headers.get("x-cache") == "HIT", near.headers.get("x-cache"))
+    check("临期命中带 Age=22", near.headers.get("age") == "22", near.headers.get("age"))
+    check("临期命中正文仍为中文", near.content == r_zh.content)
+    check("临期命中 Vary 与正文一致", vary_set(near) == {"accept", "accept-language"},
+          near.headers.get("vary", ""))
+
+
 async def test_revalidation_304(c: httpx.AsyncClient) -> None:
-    print("[2] max-age 到期带 ETag 复验，304 沿用旧正文")
+    print("[3] max-age 到期带 ETag 复验，304 沿用旧正文")
     await reset(c)
     headers = {"Accept": JSON, "Accept-Language": ZH}
     first = await c.get(f"{PROXY}/releases", headers=headers)
@@ -97,7 +129,7 @@ async def test_revalidation_304(c: httpx.AsyncClient) -> None:
 
 
 async def test_vary_switch_invalidation(c: httpx.AsyncClient) -> None:
-    print("[3] Vary 规则切换：旧规则条目整体失效，按新规则缓存")
+    print("[4] Vary 规则切换：旧规则条目整体失效，按新规则缓存")
     await reset(c)
     h_zh = {"Accept": JSON, "Accept-Language": ZH}
     h_en = {"Accept": JSON, "Accept-Language": EN}
@@ -124,8 +156,31 @@ async def test_vary_switch_invalidation(c: httpx.AsyncClient) -> None:
     check("HIT 正文为英文", r2.content == r.content)
 
 
+async def test_304_confirms_new_rule(c: httpx.AsyncClient) -> None:
+    print("[5] 304 确认新规则：沿用复验选中的正文，按新规则与新新鲜期回包")
+    await reset(c)
+    h_en = {"Accept": JSON, "Accept-Language": EN}
+    warm = await c.get(f"{PROXY}/releases", headers=h_en)
+    # 预热英文后等 cache-control 老化，切到 accept 规则（英文表示不变 -> 304）
+    await c.post(f"{PROXY}/_cache/age", json={"seconds": 31})
+    await c.post(f"{ORIGIN}/admin/vary/accept")
+    r = await c.get(f"{PROXY}/releases", headers=h_en)
+    check("英文复验在规则切换后命中 304 并提交新规则",
+          r.headers.get("x-cache") == "MISS_NEW_RULE", r.headers.get("x-cache"))
+    check("沿用复验选中的旧正文", r.content == warm.content)
+    check("按这次确认的规则回包 Vary: Accept",
+          {p.strip().lower() for p in r.headers.get("vary", "").split(",") if p.strip()} == {"accept"},
+          r.headers.get("vary", ""))
+    check("按这次确认的新鲜期回包（Age=0，max-age=30）",
+          r.headers.get("age") == "0" and "max-age=30" in r.headers.get("cache-control", ""),
+          f"age={r.headers.get('age')} cc={r.headers.get('cache-control')}")
+    inspect = (await c.get(f"{PROXY}/_cache/inspect")).json()["paths"]["/releases"]
+    check("新规则条目为英文正文且入新键",
+          inspect["entry_count"] == 1 and inspect["entries"][0]["vary"] == ["accept"], str(inspect))
+
+
 async def test_parallel_languages(c: httpx.AsyncClient) -> None:
-    print("[4] 不同语言并行回源（single-flight 只合并同变体）")
+    print("[6] 不同语言并行回源（single-flight 只合并同变体）")
     await reset(c)
     await c.post(f"{ORIGIN}/admin/delay/500")
 
@@ -150,7 +205,7 @@ async def test_parallel_languages(c: httpx.AsyncClient) -> None:
 
 
 async def test_concurrent_switch_inflight(c: httpx.AsyncClient) -> None:
-    print("[5] 并发切换（冷回源）：切换瞬间两个在途回源，负方答复只给原请求不进缓存")
+    print("[7] 并发切换（冷回源）：切换瞬间两个在途回源，负方答复只给原请求不进缓存")
     await reset(c)
     await c.post(f"{ORIGIN}/admin/delay/800")
     h_zh = {"Accept": JSON, "Accept-Language": ZH}
@@ -178,6 +233,13 @@ async def test_concurrent_switch_inflight(c: httpx.AsyncClient) -> None:
     winner = r_en if loser is r_zh else r_zh
     check("负方答复只给原请求（完整英文正文）", "Release Notes" in loser.text and loser.status_code == 200)
     check("胜方按新规则缓存（英文正文）", "Release Notes" in winner.text)
+    check("只给原请求的回包禁止 CDN 存储",
+          "no-store" in loser.headers.get("cache-control", ""), loser.headers.get("cache-control"))
+    check("只给原请求的回包 Vary 与其正文对应",
+          {p.strip().lower() for p in loser.headers.get("vary", "").split(",") if p.strip()} == {"accept"},
+          loser.headers.get("vary", ""))
+    check("正常回包带 Vary",
+          winner.headers.get("vary", "").strip().lower() == "accept", winner.headers.get("vary", ""))
 
     inspect = (await c.get(f"{PROXY}/_cache/inspect")).json()["paths"]["/releases"]
     check("新缓存只有 1 条（负方在途结果未写入）", inspect["entry_count"] == 1, str(inspect["entry_count"]))
@@ -187,7 +249,7 @@ async def test_concurrent_switch_inflight(c: httpx.AsyncClient) -> None:
 
 
 async def test_concurrent_switch_during_revalidation(c: httpx.AsyncClient) -> None:
-    print("[6] 并发切换（304 复验）：同一英文表示在规则切换后复验命中 304，旧正文只给复验方")
+    print("[8] 并发切换（304 复验）：同一英文表示在规则切换后复验命中 304，旧正文只给复验方")
     await reset(c)
     await c.post(f"{ORIGIN}/admin/delay/800")
     h_zh = {"Accept": JSON, "Accept-Language": ZH}
@@ -224,6 +286,8 @@ async def test_concurrent_switch_during_revalidation(c: httpx.AsyncClient) -> No
     else:
         # zh 的表示在新规则下不存在，源站回 200：负方仍拿到完整答复
         check("200 负方拿到完整英文正文", "Release Notes" in loser.text)
+    check("只给原请求的负方答复禁止 CDN 存储",
+          "no-store" in loser.headers.get("cache-control", ""), loser.headers.get("cache-control"))
 
     inspect = (await c.get(f"{PROXY}/_cache/inspect")).json()["paths"]["/releases"]
     check("缓存中只有新规则的 1 条", inspect["entry_count"] == 1, str(inspect["entry_count"]))
@@ -236,8 +300,55 @@ async def test_concurrent_switch_during_revalidation(c: httpx.AsyncClient) -> No
     await c.post(f"{ORIGIN}/admin/delay/0")
 
 
+async def test_late_old_rule_reply(c: httpx.AsyncClient) -> None:
+    print("[9] 新规则确认后才到达的旧规则回包：只给原请求，不恢复旧规则、不刷新条目")
+    await reset(c)
+    h_zh = {"Accept": JSON, "Accept-Language": ZH}
+    h_en = {"Accept": JSON, "Accept-Language": EN}
+
+    # 只拖住第一个回源（zh 旧规则回包），让它晚于 en 的新规则答复到达
+    await c.post(f"{ORIGIN}/admin/hold/600/1")
+    t_zh = asyncio.create_task(c.get(f"{PROXY}/releases", headers=h_zh))
+    for _ in range(100):
+        if (await origin_state(c))["held"] >= 1:
+            break
+        await asyncio.sleep(0.02)
+    check("旧规则回包已在源站挂起", (await origin_state(c))["held"] >= 1)
+
+    await c.post(f"{ORIGIN}/admin/vary/accept")  # 旧回包在途时切换规则
+    r_en = await c.get(f"{PROXY}/releases", headers=h_en)  # 新请求确认新规则
+    check("新规则请求按新规则缓存", r_en.headers.get("x-cache") == "MISS_NEW_RULE",
+          r_en.headers.get("x-cache"))
+    settled = (await c.get(f"{PROXY}/_cache/inspect")).json()["paths"]["/releases"]
+
+    r_zh = await t_zh  # 迟到的旧规则回包
+    check("迟到旧回包仍拿到完整中文正文", r_zh.status_code == 200 and "发布说明" in r_zh.text)
+    check("迟到旧回包只给原请求（INFLIGHT_RULE_SWITCHED）",
+          r_zh.headers.get("x-cache") == "INFLIGHT_RULE_SWITCHED", r_zh.headers.get("x-cache"))
+    check("迟到旧回包禁止 CDN 存储", "no-store" in r_zh.headers.get("cache-control", ""),
+          r_zh.headers.get("cache-control"))
+    check("迟到旧回包 Vary 与其中文正文对应",
+          {p.strip().lower() for p in r_zh.headers.get("vary", "").split(",") if p.strip()}
+          == {"accept", "accept-language"}, r_zh.headers.get("vary", ""))
+
+    inspect = (await c.get(f"{PROXY}/_cache/inspect")).json()["paths"]["/releases"]
+    check("旧回包未恢复旧规则", inspect["confirmed_vary"] == ["accept"], str(inspect["confirmed_vary"]))
+    check("旧回包未清空新规则条目", inspect["entry_count"] == 1, str(inspect["entry_count"]))
+    check("旧回包未新增条目、未刷新当前条目",
+          inspect["generation"] == settled["generation"]
+          and inspect["entries"][0]["stored_at"] == settled["entries"][0]["stored_at"],
+          f"settled={settled['generation']} now={inspect['generation']}")
+
+    # 新规则仍生效：中文头请求命中英文缓存
+    follow = await c.get(f"{PROXY}/releases", headers=h_zh)
+    check("新规则仍生效（中文头命中英文缓存）",
+          follow.headers.get("x-cache") == "HIT" and "Release Notes" in follow.text,
+          follow.headers.get("x-cache"))
+    await c.post(f"{ORIGIN}/admin/hold/0/0")
+
+
 async def test_origin_failure_keeps_cache(c: httpx.AsyncClient) -> None:
-    print("[7] 回源失败报错，已确认缓存状态保持不变")
+    print("[10] 回源失败报错，已确认缓存状态保持不变")
     await reset(c)
     headers = {"Accept": JSON, "Accept-Language": ZH}
     good = await c.get(f"{PROXY}/releases", headers=headers)
@@ -276,11 +387,14 @@ async def main() -> int:
                 print(f"服务不可达 {base}: {exc}")
                 return 2
         await test_content_negotiation_and_hit(c)
+        await test_cdn_response_headers(c)
         await test_revalidation_304(c)
         await test_vary_switch_invalidation(c)
+        await test_304_confirms_new_rule(c)
         await test_parallel_languages(c)
         await test_concurrent_switch_inflight(c)
         await test_concurrent_switch_during_revalidation(c)
+        await test_late_old_rule_reply(c)
         await test_origin_failure_keeps_cache(c)
 
     print(f"\n结果: {PASS} 通过 / {FAIL} 失败")

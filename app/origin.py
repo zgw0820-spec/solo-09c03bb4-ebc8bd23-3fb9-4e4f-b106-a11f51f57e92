@@ -29,8 +29,14 @@ class OriginState:
     vary_mode: str = "both"
     rule_epoch: int = 0  # 每次切换 Vary 规则递增，随响应头返回，供代理识别在途切换
     delay_ms: int = 0
+    # 渲染并读取规则世代之后再额外等待的毫秒数，用于制造“旧规则回包晚于
+    # 新规则答复到达代理”的竞态（仅测试用）；每个请求在进入处理时快照该值
+    hold_ms: int = 0
+    # 只对接下来 N 个内容请求施加 hold_ms（便于只拖住一个在途回包）
+    hold_next: int = 0
     fail_next: int = 0  # 接下来 N 个内容请求返回 500
     inflight: int = 0  # 当前正在处理（含延迟等待）的内容请求数
+    held: int = 0  # 已按旧规则渲染、正处于 hold 睡眠中的请求数（测试同步用）
     counters: dict = field(default_factory=lambda: {"requests": 0, "status304": 0, "status200": 0, "status500": 0})
 
 
@@ -137,6 +143,9 @@ async def releases(request: Request) -> Response:
         state.counters["requests"] += 1
         state.inflight += 1
         should_fail = state.fail_next > 0
+        hold_ms = state.hold_ms if state.hold_next > 0 else 0
+        if state.hold_next > 0:
+            state.hold_next -= 1
         if should_fail:
             state.fail_next -= 1
             state.counters["status500"] += 1
@@ -155,6 +164,16 @@ async def releases(request: Request) -> Response:
         vary = _vary_header()
         # 延迟结束后读取当前规则世代：在途期间切换规则会体现在这里
         epoch = str(state.rule_epoch)
+
+        # 已按旧规则渲染并取好世代后再挂起：模拟旧规则回包晚于新规则答复到达
+        if hold_ms:
+            async with _lock:
+                state.held += 1
+            try:
+                await asyncio.sleep(hold_ms / 1000.0)
+            finally:
+                async with _lock:
+                    state.held -= 1
 
         if request.headers.get("if-none-match") == etag:
             state.counters["status304"] += 1
@@ -207,6 +226,7 @@ async def admin_get_state() -> dict:
         "delay_ms": state.delay_ms,
         "fail_next": state.fail_next,
         "inflight": state.inflight,
+        "held": state.held,
         "counters": state.counters,
     }
 
@@ -232,6 +252,14 @@ async def admin_set_delay(ms: int) -> dict:
     return {"ok": True, "delay_ms": state.delay_ms}
 
 
+@app.post("/admin/hold/{ms}/{n}")
+async def admin_set_hold(ms: int, n: int) -> dict:
+    """接下来 n 个内容请求在渲染后额外延迟 ms，用于复现旧规则回包晚到。"""
+    state.hold_ms = max(0, ms)
+    state.hold_next = max(0, n)
+    return {"ok": True, "hold_ms": state.hold_ms, "hold_next": state.hold_next}
+
+
 @app.post("/admin/fail/{n}")
 async def admin_fail(n: int) -> dict:
     state.fail_next = max(0, n)
@@ -243,7 +271,10 @@ async def admin_reset() -> dict:
     state.vary_mode = "both"
     state.rule_epoch = 0
     state.delay_ms = 0
+    state.hold_ms = 0
+    state.hold_next = 0
     state.fail_next = 0
     state.inflight = 0
+    state.held = 0
     state.counters = {"requests": 0, "status304": 0, "status200": 0, "status500": 0}
     return {"ok": True}
