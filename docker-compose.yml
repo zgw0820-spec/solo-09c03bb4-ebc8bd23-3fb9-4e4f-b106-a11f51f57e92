@@ -1,0 +1,44 @@
+services:
+  origin:
+    build: .
+    image: docs-cache-demo:latest
+    command: uvicorn app.origin:app --host 0.0.0.0 --port 8080
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  proxy:
+    build: .
+    image: docs-cache-demo:latest
+    command: uvicorn app.proxy:app --host 0.0.0.0 --port 8000
+    environment:
+      # 容器内通过服务名访问源站
+      ORIGIN_BASE: http://origin:8080
+    ports:
+      - "18000:8000"
+    depends_on:
+      origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # 并发切换自测：docker compose run --rm self-test
+  self-test:
+    image: docs-cache-demo:latest
+    command: python -m app.tests.selftest
+    environment:
+      PROXY_BASE: http://proxy:8000
+      ORIGIN_BASE: http://origin:8080
+    depends_on:
+      proxy:
+        condition: service_healthy
+      origin:
+        condition: service_healthy
+    profiles: ["test"]
